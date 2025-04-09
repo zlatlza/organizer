@@ -4,11 +4,21 @@ import re
 import shutil
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
-from datetime import datetime
+from datetime import datetime, timedelta
 import PyPDF2
 import subprocess
 import platform
 import dateutil.parser
+import threading
+import queue
+
+# Add pdfplumber for faster PDF processing
+try:
+    import pdfplumber
+    PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    PDFPLUMBER_AVAILABLE = False
+    print("pdfplumber not available, using PyPDF2 as fallback")
 
 class CategoryEditor(tk.Toplevel):
     def __init__(self, parent, categories, callback):
@@ -1344,20 +1354,70 @@ class PDFOrganizer(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", f"Could not open PDF: {str(e)}")
     
-    def extract_text_from_pdf(self, filename):
+    def extract_text_from_pdf(self, filename, max_pages=3):
+        """Extract text from PDF file with optimized performance
+        
+        Args:
+            filename: Path to the PDF file
+            max_pages: Maximum number of pages to extract (default 3)
+        
+        Returns:
+            Extracted text as string
+        """
+        # Use pdfplumber if available, it's faster and more reliable
+        if PDFPLUMBER_AVAILABLE:
+            try:
+                with pdfplumber.open(filename) as pdf:
+                    # Only process the first few pages for speed
+                    pages_to_extract = min(len(pdf.pages), max_pages)
+                    
+                    text = ""
+                    # Process pages in batches for better performance
+                    for i in range(pages_to_extract):
+                        try:
+                            page = pdf.pages[i]
+                            page_text = page.extract_text(x_tolerance=3) or ""
+                            
+                            # Only add non-empty pages
+                            if page_text.strip():
+                                text += page_text + "\n\n"
+                                
+                                # If we found substantial text, we can stop early
+                                if len(text) > 2000:
+                                    break
+                        except Exception as e:
+                            print(f"Error extracting text from page {i}: {str(e)}")
+                            continue
+                    
+                    return text
+            except Exception as e:
+                print(f"Error with pdfplumber: {str(e)}. Falling back to PyPDF2.")
+                # Fall back to PyPDF2
+        
+        # PyPDF2 fallback
         try:
             with open(filename, 'rb') as file:
                 reader = PyPDF2.PdfReader(file)
                 text = ""
-                # Extract text from first few pages (max 5)
-                num_pages = min(len(reader.pages), 5)
+                # Extract text from limited pages
+                num_pages = min(len(reader.pages), max_pages)
+                
                 for i in range(num_pages):
-                    page_text = reader.pages[i].extract_text()
-                    if page_text:
-                        text += page_text + "\n"
+                    try:
+                        page_text = reader.pages[i].extract_text() or ""
+                        if page_text.strip():
+                            text += page_text + "\n\n"
+                            
+                            # If we found substantial text, we can stop early for performance
+                            if len(text) > 2000:
+                                break
+                    except Exception as page_error:
+                        print(f"Error extracting text from page {i}: {str(page_error)}")
+                        continue
+                        
                 return text
         except Exception as e:
-            print(f"Error extracting text: {str(e)}")
+            print(f"Error extracting text with PyPDF2: {str(e)}")
             return ""
     
     def extract_date_from_pdf(self, text):
@@ -1731,7 +1791,7 @@ class PDFOrganizer(tk.Tk):
             self.set_today()  # This will update using the new format
 
     def auto_process_all(self):
-        """Automatically process all PDFs in the current directory"""
+        """Automatically process all PDFs in the current directory using background threads"""
         if not self.all_pdfs:
             messagebox.showinfo("Info", "No PDF files found to process")
             return
@@ -1744,11 +1804,12 @@ class PDFOrganizer(tk.Tk):
         # Ask for confirmation
         if not messagebox.askyesno("Confirm", f"This will automatically process {len(self.all_pdfs)} PDF files.\nContinue?"):
             return
-            
-        # First pass: Analyze all PDFs to identify ones that need manual intervention
-        manual_processing_needed = []
-        analysis_results = {}
-        
+    
+        # Create a queue for thread communication
+        self.analysis_queue = queue.Queue()
+        self.analysis_results = {}
+        self.manual_processing_needed = []
+    
         # Create progress dialog for analysis
         analysis_window = tk.Toplevel(self)
         analysis_window.title("Analyzing PDFs")
@@ -1756,34 +1817,67 @@ class PDFOrganizer(tk.Tk):
         analysis_window.resizable(False, False)
         analysis_window.transient(self)
         analysis_window.grab_set()
-        
+    
         # Analysis progress frame
         analysis_frame = ttk.Frame(analysis_window, padding=10)
         analysis_frame.pack(fill=tk.BOTH, expand=True)
-        
+    
         # Status label
         analysis_status_var = tk.StringVar(value="Analyzing files...")
         ttk.Label(analysis_frame, textvariable=analysis_status_var).pack(pady=(0, 10))
-        
+    
         # Current file label
-        current_file_var = tk.StringVar(value="")
+        current_file_var = tk.StringVar(value="Starting analysis...")
         ttk.Label(analysis_frame, textvariable=current_file_var).pack(pady=(0, 10))
-        
+    
         # Progress bar
         analysis_progress_var = tk.DoubleVar(value=0.0)
         analysis_progress_bar = ttk.Progressbar(analysis_frame, variable=analysis_progress_var, maximum=len(self.all_pdfs))
         analysis_progress_bar.pack(fill=tk.X, pady=(0, 10))
-        
-        # Update UI
-        analysis_window.update()
-        
-        # Analyze each PDF
+    
+        # Cancel button
+        cancel_button = ttk.Button(analysis_frame, text="Cancel", command=lambda: self.cancel_analysis(analysis_window))
+        cancel_button.pack(pady=(5, 0))
+    
+        # Store in instance variables to access in other methods
+        self.analysis_window = analysis_window
+        self.analysis_progress_var = analysis_progress_var
+        self.current_file_var = current_file_var
+        self.analysis_canceled = False
+    
+        # Start worker threads to analyze PDFs
+        self.worker_threads = []
+        max_threads = max(1, min(8, (os.cpu_count() or 4) - 1))  # Use up to N-1 CPU cores, max 8
+    
+        # Split files among threads
+        files_per_thread = [[] for _ in range(max_threads)]
         for i, pdf_file in enumerate(self.all_pdfs):
-            # Update progress UI
-            analysis_progress_var.set(i + 1)
-            current_file_var.set(f"Analyzing: {pdf_file}")
-            analysis_window.update()
-            
+            files_per_thread[i % max_threads].append(pdf_file)
+    
+        # Start threads
+        for thread_files in files_per_thread:
+            if not thread_files:
+                continue
+            thread = threading.Thread(target=self.analyze_pdfs_thread, args=(thread_files,))
+            thread.daemon = True
+            self.worker_threads.append(thread)
+            thread.start()
+    
+        # Schedule progress check
+        self.after(100, lambda: self.check_analysis_progress(len(self.all_pdfs)))
+
+    def cancel_analysis(self, window=None):
+        """Cancel the analysis process"""
+        self.analysis_canceled = True
+        if window:
+            window.destroy()
+
+    def analyze_pdfs_thread(self, pdf_files):
+        """Worker thread to analyze PDFs"""
+        for pdf_file in pdf_files:
+            if self.analysis_canceled:
+                return
+                
             try:
                 if os.path.exists(pdf_file):
                     # Extract text from PDF
@@ -1797,168 +1891,245 @@ class PDFOrganizer(tk.Tk):
                     # Detect category
                     detected_category, confidence = self.detect_category_with_confidence(pdf_text)
                     
-                    # Store results for later use
-                    analysis_results[pdf_file] = {
+                    # Store results
+                    result = {
+                        "pdf_file": pdf_file,
                         "text": pdf_text,
                         "date": detected_date,
                         "category": detected_category,
                         "confidence": confidence
                     }
                     
-                    # If missing date or category, mark for manual processing
-                    if not detected_date or not detected_category or confidence < 1:
-                        manual_processing_needed.append(pdf_file)
+                    # Put in queue
+                    self.analysis_queue.put(result)
+                    
             except Exception as e:
                 print(f"Error analyzing {pdf_file}: {str(e)}")
-                manual_processing_needed.append(pdf_file)
-        
+                # Report error
+                self.analysis_queue.put({"pdf_file": pdf_file, "error": str(e)})
+
+    def check_analysis_progress(self, total_files):
+        """Update the progress UI and check if all threads are done"""
+        if self.analysis_canceled:
+            return
+                
+        try:
+            # Process all available results in the queue
+            processed = 0
+            while not self.analysis_queue.empty():
+                result = self.analysis_queue.get(block=False)
+                pdf_file = result.get("pdf_file")
+                processed += 1
+                
+                # Update progress info
+                self.current_file_var.set(f"Analyzing: {pdf_file}")
+                
+                # Store the result
+                if "error" in result:
+                    # Mark for manual processing on error
+                    self.manual_processing_needed.append(pdf_file)
+                else:
+                    self.analysis_results[pdf_file] = result
+                    # Check if needs manual processing
+                    if not result.get("date") or not result.get("category") or result.get("confidence", 0) < 1:
+                        self.manual_processing_needed.append(pdf_file)
+                
+                # Update progress bar
+                current = len(self.analysis_results) + len(self.manual_processing_needed) 
+                self.analysis_progress_var.set(current)
+            
+            # Check if all threads are done
+            active_threads = sum(1 for t in self.worker_threads if t.is_alive())
+            
+            if active_threads == 0 and self.analysis_queue.empty():
+                # All threads completed
+                self.finish_analysis()
+            else:
+                # Check again after a delay
+                self.after(100, lambda: self.check_analysis_progress(total_files))
+                
+        except Exception as e:
+            print(f"Error in progress update: {str(e)}")
+            self.after(100, lambda: self.check_analysis_progress(total_files))
+
+    def finish_analysis(self):
+        """Complete the analysis and proceed with processing"""
         # Close analysis window
-        analysis_window.destroy()
+        if hasattr(self, 'analysis_window') and self.analysis_window:
+            self.analysis_window.destroy()
         
-        # If files need manual processing, show dialog
-        if manual_processing_needed:
+        if self.analysis_canceled:
+            return
+                
+        # Handle manual processing if needed
+        if self.manual_processing_needed:
             manual_process_result = messagebox.askyesno(
                 "Manual Processing Required",
-                f"{len(manual_processing_needed)} files require manual processing.\n\n"
+                f"{len(self.manual_processing_needed)} files require manual processing.\n\n"
                 "Would you like to process these files now?\n\n"
                 "If you select 'No', these files will be moved to the 'needs_further_processing' folder."
             )
             
             if manual_process_result:
-                # Handle manual processing
-                for pdf_file in manual_processing_needed:
-                    # Create dialog for manual processing
-                    manual_window = tk.Toplevel(self)
-                    manual_window.title(f"Manual Processing: {pdf_file}")
-                    manual_window.geometry("600x500")
-                    manual_window.resizable(True, True)
-                    manual_window.transient(self)
-                    manual_window.grab_set()
-                    
-                    # File info frame
-                    info_frame = ttk.Frame(manual_window, padding=10)
-                    info_frame.pack(fill=tk.BOTH, expand=True)
-                    
-                    # Show file details
-                    ttk.Label(info_frame, text=f"File: {pdf_file}", font=("", 10, "bold")).pack(anchor=tk.W, pady=(0, 10))
-                    
-                    # PDF content preview
-                    ttk.Label(info_frame, text="PDF Content Preview:").pack(anchor=tk.W)
-                    
-                    # Text widget with scrollbar for content
-                    text_frame = ttk.Frame(info_frame)
-                    text_frame.pack(fill=tk.BOTH, expand=True)
-                    
-                    text_box = tk.Text(text_frame, wrap=tk.WORD, height=10)
-                    text_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-                    
-                    text_scrollbar = ttk.Scrollbar(text_frame)
-                    text_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-                    
-                    # Connect scrollbar to text box
-                    text_box.config(yscrollcommand=text_scrollbar.set)
-                    text_scrollbar.config(command=text_box.yview)
-                    
-                    # Insert content
-                    pdf_data = analysis_results.get(pdf_file, {})
-                    pdf_text = pdf_data.get("text", "")
-                    text_box.insert("1.0", pdf_text[:2000] + 
-                                   ("\n\n[...content truncated...]" if len(pdf_text) > 2000 else ""))
-                    text_box.config(state="disabled")  # Make read-only
-                    
-                    # Category selection
-                    category_frame = ttk.Frame(info_frame)
-                    category_frame.pack(fill=tk.X, pady=(0, 5))
-                    
-                    ttk.Label(category_frame, text="Category:").pack(side=tk.LEFT)
-                    
-                    category_var = tk.StringVar()
-                    if pdf_data.get("category"):
-                        category_var.set(pdf_data["category"])
-                        
-                    category_combo = ttk.Combobox(category_frame, textvariable=category_var, width=20)
-                    category_combo['values'] = list(self.categories.keys())
-                    category_combo.pack(side=tk.LEFT, padx=5)
-                    
-                    # Date selection
-                    date_frame = ttk.Frame(info_frame)
-                    date_frame.pack(fill=tk.X, pady=(0, 5))
-                    
-                    date_format = self.settings.get("date_format", "ddmmyy")
-                    date_format_display = date_format.upper()
-                    
-                    ttk.Label(date_frame, text=f"Date ({date_format_display}):").pack(side=tk.LEFT)
-                    
-                    date_var = tk.StringVar()
-                    # Format the date if available
-                    if pdf_data.get("date"):
-                        detected_date = pdf_data["date"]
-                        if date_format == "ddmmyy":
-                            formatted_date = detected_date.strftime("%d%m%y")
-                        elif date_format == "mmddyy":
-                            formatted_date = detected_date.strftime("%m%d%y")
-                        elif date_format == "yymmdd":
-                            formatted_date = detected_date.strftime("%y%m%d")
-                        else:
-                            formatted_date = detected_date.strftime("%d%m%y")  # Default
-                        date_var.set(formatted_date)
-                    
-                    date_entry = ttk.Entry(date_frame, textvariable=date_var, width=8)
-                    date_entry.pack(side=tk.LEFT, padx=5)
-                    
-                    # Store the result
-                    result_data = {
-                        "processed": False,
-                        "category": None,
-                        "date": None
-                    }
-                    
-                    # Process function
-                    def process_file():
-                        # Validate inputs
-                        if not category_var.get():
-                            messagebox.showinfo("Info", "Please select a category")
-                            return
-                            
-                        if not re.match(r'^\d{6}$', date_var.get()):
-                            messagebox.showinfo("Info", "Date must be in 6-digit format (e.g., 311223)")
-                            return
-                            
-                        # Store result
-                        result_data["processed"] = True
-                        result_data["category"] = category_var.get()
-                        result_data["date"] = date_var.get()
-                        
-                        # Close window
-                        manual_window.destroy()
-                    
-                    # Skip function
-                    def skip_file():
-                        manual_window.destroy()
-                    
-                    # Buttons
-                    buttons_frame = ttk.Frame(info_frame)
-                    buttons_frame.pack(fill=tk.X, pady=(10, 0))
-                    
-                    process_button = ttk.Button(buttons_frame, text="Process File", command=process_file)
-                    process_button.pack(side=tk.RIGHT, padx=5)
-                    
-                    skip_button = ttk.Button(buttons_frame, text="Skip File", command=skip_file)
-                    skip_button.pack(side=tk.RIGHT, padx=5)
-                    
-                    # Wait for window to close
-                    self.wait_window(manual_window)
-                    
-                    # Update analysis results with manual input
-                    if result_data["processed"]:
-                        analysis_results[pdf_file]["manual_category"] = result_data["category"]
-                        analysis_results[pdf_file]["manual_date"] = result_data["date"]
-                    else:
-                        # Mark for further processing folder if skipped
-                        analysis_results[pdf_file]["skip"] = True
+                # Process one file at a time
+                self.handle_manual_processing()
+            else:
+                # Mark all for skipping
+                for pdf_file in self.manual_processing_needed:
+                    if pdf_file in self.analysis_results:
+                        self.analysis_results[pdf_file]["skip"] = True
+                
+                # Process the results
+                self.process_analyzed_files(self.analysis_results)
+        else:
+            # No manual processing needed, proceed with automated processing
+            self.process_analyzed_files(self.analysis_results)
+
+    def handle_manual_processing(self, index=0):
+        """Handle manual processing of files one at a time"""
+        if index >= len(self.manual_processing_needed) or self.analysis_canceled:
+            # All manual files processed, proceed with automated processing
+            self.process_analyzed_files(self.analysis_results)
+            return
+                
+        pdf_file = self.manual_processing_needed[index]
         
-        # Now process all files
-        self.process_analyzed_files(analysis_results)
+        # Create dialog for manual processing
+        manual_window = tk.Toplevel(self)
+        manual_window.title(f"Manual Processing: {pdf_file}")
+        manual_window.geometry("600x500")
+        manual_window.resizable(True, True)
+        manual_window.transient(self)
+        manual_window.grab_set()
+        
+        # File info frame
+        info_frame = ttk.Frame(manual_window, padding=10)
+        info_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Show file details
+        ttk.Label(info_frame, text=f"File: {pdf_file}", font=("", 10, "bold")).pack(anchor=tk.W, pady=(0, 10))
+        
+        # PDF content preview
+        ttk.Label(info_frame, text="PDF Content Preview:").pack(anchor=tk.W)
+        
+        # Text widget with scrollbar for content
+        text_frame = ttk.Frame(info_frame)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+        
+        text_box = tk.Text(text_frame, wrap=tk.WORD, height=10)
+        text_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        text_scrollbar = ttk.Scrollbar(text_frame)
+        text_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Connect scrollbar to text box
+        text_box.config(yscrollcommand=text_scrollbar.set)
+        text_scrollbar.config(command=text_box.yview)
+        
+        # Insert content
+        pdf_data = self.analysis_results.get(pdf_file, {})
+        pdf_text = pdf_data.get("text", "")
+        text_box.insert("1.0", pdf_text[:2000] + 
+                       ("\n\n[...content truncated...]" if len(pdf_text) > 2000 else ""))
+        text_box.config(state="disabled")  # Make read-only
+        
+        # Category selection
+        category_frame = ttk.Frame(info_frame)
+        category_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Label(category_frame, text="Category:").pack(side=tk.LEFT)
+        
+        category_var = tk.StringVar()
+        if pdf_data.get("category"):
+            category_var.set(pdf_data["category"])
+            
+        category_combo = ttk.Combobox(category_frame, textvariable=category_var, width=20)
+        category_combo['values'] = list(self.categories.keys())
+        category_combo.pack(side=tk.LEFT, padx=5)
+        
+        # Date selection
+        date_frame = ttk.Frame(info_frame)
+        date_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        date_format = self.settings.get("date_format", "ddmmyy")
+        date_format_display = date_format.upper()
+        
+        ttk.Label(date_frame, text=f"Date ({date_format_display}):").pack(side=tk.LEFT)
+        
+        date_var = tk.StringVar()
+        # Format the date if available
+        if pdf_data.get("date"):
+            detected_date = pdf_data["date"]
+            if date_format == "ddmmyy":
+                formatted_date = detected_date.strftime("%d%m%y")
+            elif date_format == "mmddyy":
+                formatted_date = detected_date.strftime("%m%d%y")
+            elif date_format == "yymmdd":
+                formatted_date = detected_date.strftime("%y%m%d")
+            else:
+                formatted_date = detected_date.strftime("%d%m%y")  # Default
+            date_var.set(formatted_date)
+        
+        date_entry = ttk.Entry(date_frame, textvariable=date_var, width=8)
+        date_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Store the result
+        result_data = {
+            "processed": False,
+            "category": None,
+            "date": None
+        }
+        
+        # Process function
+        def process_file():
+            # Validate inputs
+            if not category_var.get():
+                messagebox.showinfo("Info", "Please select a category")
+                return
+                
+            if not re.match(r'^\d{6}$', date_var.get()):
+                messagebox.showinfo("Info", "Date must be in 6-digit format (e.g., 311223)")
+                return
+                
+            # Store result
+            result_data["processed"] = True
+            result_data["category"] = category_var.get()
+            result_data["date"] = date_var.get()
+            
+            # Close window
+            manual_window.destroy()
+        
+        # Skip function
+        def skip_file():
+            manual_window.destroy()
+        
+        # Buttons
+        buttons_frame = ttk.Frame(info_frame)
+        buttons_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        process_button = ttk.Button(buttons_frame, text="Process File", command=process_file)
+        process_button.pack(side=tk.RIGHT, padx=5)
+        
+        skip_button = ttk.Button(buttons_frame, text="Skip File", command=skip_file)
+        skip_button.pack(side=tk.RIGHT, padx=5)
+        
+        # Wait for window to close
+        self.wait_window(manual_window)
+        
+        # Update analysis results with manual input
+        if result_data["processed"]:
+            if pdf_file not in self.analysis_results:
+                self.analysis_results[pdf_file] = {}
+            self.analysis_results[pdf_file]["manual_category"] = result_data["category"]
+            self.analysis_results[pdf_file]["manual_date"] = result_data["date"]
+        else:
+            # Mark for further processing folder if skipped
+            if pdf_file not in self.analysis_results:
+                self.analysis_results[pdf_file] = {}
+            self.analysis_results[pdf_file]["skip"] = True
+        
+        # Process the next file
+        self.after(100, lambda: self.handle_manual_processing(index + 1))
 
     def verify_folders_before_processing(self):
         """Ensure all needed folders exist before processing files"""
