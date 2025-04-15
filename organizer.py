@@ -1168,6 +1168,18 @@ class PDFOrganizer(tk.Tk):
         self.file_listbox.bind('<Double-1>', self.on_double_click)
         # Add right-click context menu
         self.file_listbox.bind('<Button-3>', self.show_context_menu)
+        # Add click handler to ensure listbox gets focus
+        self.file_listbox.bind('<Button-1>', lambda e: self.file_listbox.focus_set())
+        # Add keyboard navigation directly to the listbox
+        self.file_listbox.bind('<Up>', self.handle_arrow_key)
+        self.file_listbox.bind('<Down>', self.handle_arrow_key)
+        self.file_listbox.bind('<Left>', self.handle_arrow_key)
+        self.file_listbox.bind('<Right>', self.handle_arrow_key)
+        # Also bind to main window for better coverage
+        self.bind('<Up>', self.handle_arrow_key)
+        self.bind('<Down>', self.handle_arrow_key)
+        self.bind('<Left>', self.handle_arrow_key)
+        self.bind('<Right>', self.handle_arrow_key)
         # Apply theme colors
         self.file_listbox.config(
             bg=self.list_colors["bg"],
@@ -2319,15 +2331,68 @@ class PDFOrganizer(tk.Tk):
             # Reload PDFs for the current page
             self.load_pdfs_page()
             
-            # Select the next item in the list
+            # Select the next item in the list and load its details
             new_size = self.file_listbox.size()
             if new_size > 0:
-                if selected_index < new_size:
-                    self.file_listbox.selection_set(selected_index)
-                else:
-                    self.file_listbox.selection_set(new_size - 1)
+                new_selected_index = min(selected_index, new_size - 1)
+                self.file_listbox.selection_clear(0, tk.END)
+                self.file_listbox.selection_set(new_selected_index)
+                self.file_listbox.see(new_selected_index)
                 
-            # Clear form fields
+                # Get the selected file and load it
+                item_text = self.file_listbox.get(new_selected_index)
+                
+                # Skip folders and navigation items
+                if item_text != ".." and not (item_text.startswith("[") and item_text.endswith("]")):
+                    # Determine the full path based on current folder
+                    if self.current_folder:
+                        filename = os.path.join(self.current_folder, item_text)
+                    else:
+                        filename = item_text
+                        
+                    # Load the selected file if it exists
+                    if os.path.exists(filename):
+                        self.current_file = filename
+                        self.selected_file_var.set(os.path.basename(filename))
+                        
+                        # Clear text box
+                        self.text_box.delete("1.0", tk.END)
+                        
+                        # If it's a PDF, extract text and try to detect date/category
+                        if filename.lower().endswith('.pdf'):
+                            # Extract text from PDF
+                            self.current_text = self.extract_text_from_pdf(filename)
+                            
+                            # Display text in text box
+                            self.text_box.insert(tk.END, self.current_text[:10000])  # Limit display for performance
+                            
+                            # Auto-fill date field
+                            detected_date = self.extract_date_from_pdf(self.current_text)
+                            if not detected_date:
+                                # Try to extract from filename if not found in content
+                                detected_date = self.extract_date_from_filename(os.path.basename(filename))
+                            
+                            if detected_date:
+                                formatted_date = self.format_date(detected_date)
+                                self.date_var.set(formatted_date)
+                                self.detected_date_var.set(formatted_date)
+                            else:
+                                # If no date detected, set to today's date
+                                self.set_today()
+                                self.detected_date_var.set("")
+                            
+                            # Auto-detect category
+                            detected_category = self.detect_category(self.current_text)
+                            if detected_category:
+                                self.detected_var.set(detected_category)
+                                # Also set the category for preview
+                                self.category_var.set(detected_category)
+                            else:
+                                self.detected_var.set("")
+                                # Clear the category if none detected
+                                self.category_var.set("")
+                
+            # Clear specific field
             self.specific_var.set("")
             
             # Update preview
@@ -3455,6 +3520,60 @@ class PDFOrganizer(tk.Tk):
         
         # Show context menu
         context_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def handle_arrow_key(self, event):
+        """Handle arrow key presses to navigate the file listbox"""
+        # Give focus to the listbox (important for consistent navigation)
+        self.file_listbox.focus_set()
+        
+        # Get current selection
+        if self.file_listbox.curselection():
+            current_index = self.file_listbox.curselection()[0]
+        else:
+            # No current selection - try to select the first item
+            if self.file_listbox.size() > 0:
+                current_index = 0
+                self.file_listbox.selection_set(current_index)
+            else:
+                # Empty listbox
+                return "break"
+        
+        new_index = current_index
+        
+        # Determine new index based on key pressed
+        if event.keysym == 'Up' and current_index > 0:
+            new_index = current_index - 1
+        elif event.keysym == 'Down' and current_index < self.file_listbox.size() - 1:
+            new_index = current_index + 1
+        elif event.keysym == 'Left' and self.current_page > 1:
+            # Go to previous page
+            self.prev_page()
+            # Select the first item on the new page if available
+            if self.file_listbox.size() > 0:
+                self.file_listbox.selection_set(0)
+                self.file_listbox.see(0)
+                self.on_file_select(event)
+            return "break"
+        elif event.keysym == 'Right' and self.current_page < self.total_pages:
+            # Go to next page
+            self.next_page()
+            # Select the first item on the new page if available
+            if self.file_listbox.size() > 0:
+                self.file_listbox.selection_set(0)
+                self.file_listbox.see(0)
+                self.on_file_select(event)
+            return "break"
+        
+        # If index changed, select the new item
+        if new_index != current_index and new_index >= 0:
+            self.file_listbox.selection_clear(0, tk.END)
+            self.file_listbox.selection_set(new_index)
+            self.file_listbox.see(new_index)
+            
+            # Trigger the on_file_select method to load file details
+            self.on_file_select(event)
+        
         return "break"
 
 if __name__ == "__main__":
